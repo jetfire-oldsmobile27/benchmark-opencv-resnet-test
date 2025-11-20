@@ -117,8 +117,9 @@ bool process_first_stage(const cv::Mat& frame, const TriggerConfig& config, bool
     
     // Бинаризация по исправленному алгоритму Брэдли
     cv::Mat binary_bradley;
-    cv::adaptiveThreshold(blurred, binary_bradley, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 11, 2);
-    // bradley_threshold(blurred, binary_bradley, config.bradley_window, config.bradley_sensitivity);
+    //cv::adaptiveThreshold(blurred, binary_bradley, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 11, 2); // Быстрее но порог пройдет срабатывания по дефектовке 555.333 FPS
+    cv::Canny(blurred, binary_bradley, 50, 150); // Лучшее но  363.913 FPS
+
     
     if (demo_mode) {
         cv::Mat display_bradley;
