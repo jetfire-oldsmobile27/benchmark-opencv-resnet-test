@@ -26,70 +26,124 @@ namespace fs = std::filesystem;
 // Конфигурация алгоритма-триггера (только первый этап)
 struct TriggerConfig {
     int bradley_window = 41;          // Размер окна для алгоритма Брэдли
-    float bradley_sensitivity = 0.15f; // Чувствительность алгоритма Брэдли
+    float bradley_sensitivity = 0.17f; // Чувствительность алгоритма Брэдли (порог)
+    int block_fraction = 16;          // Доля от ширины для вычисления размера окна (как в исходном коде)
+    bool use_fixed_window = false;    // Использовать фиксированный размер окна (true) или на основе ширины (false)
 };
 
+
 /**
- * ПЕРВЫЙ ЭТАП: Алгоритм Брэдли для адаптивной бинаризации
- * С добавлением отладки
+ * Алгоритм Брэдли для адаптивной бинаризации (исправленная версия)
  */
-void bradley_threshold(const cv::Mat& src, cv::Mat& dst, int window_size, float t) {
+void bradley_threshold_optimized(const cv::Mat& src, cv::Mat& dst, const TriggerConfig& config, bool verbose = false) {
     CV_Assert(src.type() == CV_8UC1);
+    
+    const int width = src.cols;
+    const int height = src.rows;
+    
+    int window_size;
+    if (config.use_fixed_window) {
+        window_size = config.bradley_window;
+    } else {
+        window_size = width / config.block_fraction;
+        if (window_size % 2 == 0) window_size++;
+    }
     
     // Вычисление интегрального изображения
     cv::Mat integral;
-    cv::integral(src, integral, CV_32S);
+    cv::integral(src, integral, CV_32S); // Используем int для скорости
     
     dst.create(src.size(), CV_8UC1);
-    int half_window = window_size / 2;
     
+    int half_window = window_size / 2;
     int total_pixels_above = 0;
     int total_pixels_below = 0;
     
-    for (int r = 0; r < src.rows; ++r) {
-        int top = std::max(0, r - half_window);
-        int bottom = std::min(src.rows - 1, r + half_window);
+    for (int i = 0; i < height; ++i) {
+        const uchar* src_row = src.ptr<uchar>(i);
+        uchar* dst_row = dst.ptr<uchar>(i);
         
-        for (int c = 0; c < src.cols; ++c) {
-            int left = std::max(0, c - half_window);
-            int right = std::min(src.cols - 1, c + half_window);
+        int top = std::max(0, i - half_window);
+        int bottom = std::min(height - 1, i + half_window);
+        
+        for (int j = 0; j < width; ++j) {
+            int left = std::max(0, j - half_window);
+            int right = std::min(width - 1, j + half_window);
             
+
             int sum = integral.at<int>(bottom + 1, right + 1) 
                     - integral.at<int>(top, right + 1) 
                     - integral.at<int>(bottom + 1, left) 
                     + integral.at<int>(top, left);
             
-            int area = (bottom - top + 1) * (right - left + 1);
+            int count = (right - left + 1) * (bottom - top + 1);
             
-            // ИСПРАВЛЕНИЕ: Правильное вычисление порога
-            // Среднее значение в окне = sum / area
-            // Порог = среднее * чувствительность
-            int mean_value = sum / area;
-            int threshold = static_cast<int>(mean_value * t);
             
-            // ИСПРАВЛЕНИЕ: Инвертируем логику для царапин
-            // Царапины обычно ТЕМНЕЕ фона, поэтому должны быть ЧЕРНЫМИ
-            if (src.at<uchar>(r, c) < threshold) {
-                dst.at<uchar>(r, c) = 0;    // Черный - потенциальный дефект
-                total_pixels_below++;
-            } else {
-                dst.at<uchar>(r, c) = 255;  // Белый - фон
+            uchar pixel_value = src_row[j];
+            uint8_t output_value = 0;
+            
+            int mean_value = sum / count;
+            int threshold = static_cast<int>(mean_value * (1.0 - config.bradley_sensitivity));
+            
+
+            if (pixel_value > threshold) {
+                output_value = 255; // Белый - фон
                 total_pixels_above++;
+            } else {
+                output_value = 0;   // Черный - потенциальный дефект
+                total_pixels_below++;
             }
+            
+            dst_row[j] = output_value;
         }
     }
     
-    // Отладочная информация
-    std::cout << "Bradley threshold stats: " << std::endl;
-    std::cout << "  Pixels below threshold (potential defects): " << total_pixels_below << std::endl;
-    std::cout << "  Pixels above threshold (background): " << total_pixels_above << std::endl;
-    std::cout << "  Defect ratio: " << (double)total_pixels_below / (total_pixels_above + total_pixels_below) * 100.0 << "%" << std::endl;
+    if (verbose) {
+        std::cout << "Bradley threshold stats: " << std::endl;
+        std::cout << "  Window size: " << window_size << " (";
+        if (config.use_fixed_window) {
+            std::cout << "fixed";
+        } else {
+            std::cout << "width/" << config.block_fraction;
+        }
+        std::cout << ")" << std::endl;
+        std::cout << "  Sensitivity: " << config.bradley_sensitivity << std::endl;
+        std::cout << "  Pixels below threshold (potential defects): " << total_pixels_below << std::endl;
+        std::cout << "  Pixels above threshold (background): " << total_pixels_above << std::endl;
+        double total_pixels = total_pixels_above + total_pixels_below;
+        if (total_pixels > 0) {
+            std::cout << "  Defect ratio: " << (double)total_pixels_below / total_pixels * 100.0 << "%" << std::endl;
+        }
+    }
 }
+
+/**
+ * Фоновый прямоугольник для лучшей читаемости
+ */
+void drawTextWithBackground(cv::Mat& img, const std::string& text,
+                           cv::Point pos, double fontScale, int thickness) {
+    int baseline = 0;
+    cv::Size textSize = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX,
+                                       fontScale, thickness, &baseline);
+    
+    cv::Point rectTL(pos.x - 2, pos.y - 2 - baseline);
+    cv::Point rectBR(pos.x + textSize.width + 2,
+                     pos.y + textSize.height + 2);
+    
+    cv::rectangle(img, rectTL, rectBR, cv::Scalar(0, 0, 0, 150),
+                  -1, cv::LINE_AA);
+    
+    cv::putText(img, text, pos, cv::FONT_HERSHEY_SIMPLEX,
+               fontScale, cv::Scalar(255, 255, 255), thickness, cv::LINE_AA);
+}
+
 /**
  * ПЕРВЫЙ ЭТАП: Основной конвейер обработки
  * Включает только предобработку и бинаризацию
  */
 bool process_first_stage(const cv::Mat& frame, const TriggerConfig& config, bool demo_mode = false) {
+    cv::Mat original_copy = frame.clone(); // Копия для визуализации
+    
     if (demo_mode) {
         cv::Mat display_frame = frame.clone();
         cv::putText(display_frame, "1. Original Image", cv::Point(10, 30), 
@@ -102,7 +156,6 @@ bool process_first_stage(const cv::Mat& frame, const TriggerConfig& config, bool
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
     
-    // Легкое размытие для уменьшения шума
     cv::Mat blurred;
     cv::GaussianBlur(gray, blurred, cv::Size(3, 3), 0);
     
@@ -115,83 +168,91 @@ bool process_first_stage(const cv::Mat& frame, const TriggerConfig& config, bool
         cv::waitKey(0);
     }
     
-    // Бинаризация по исправленному алгоритму Брэдли
+    // Бинаризация по алгоритму Брэдли
     cv::Mat binary_bradley;
-    //cv::adaptiveThreshold(blurred, binary_bradley, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 11, 2); // Быстрее но порог пройдет срабатывания по дефектовке 555.333 FPS
-    cv::Canny(blurred, binary_bradley, 50, 150); // Лучшее но  363.913 FPS
-
+    bradley_threshold_optimized(blurred, binary_bradley, config, demo_mode);
     
     if (demo_mode) {
         cv::Mat display_bradley;
         cv::cvtColor(binary_bradley, display_bradley, cv::COLOR_GRAY2BGR);
         cv::putText(display_bradley, "3. Bradley Binary", cv::Point(10, 30), 
-                   cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+                   cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
         cv::imshow("Processing Steps", display_bradley);
         cv::waitKey(0);
     }
     
-    // // АГРЕССИВНАЯ ФИЛЬТРАЦИЯ ШУМА
-    // cv::Mat cleaned;
+    cv::Mat binary_inv;
+    cv::bitwise_not(binary_bradley, binary_inv);
     
-    // // 1. Морфологическое закрытие для объединения близких областей
-    // cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    // cv::morphologyEx(binary_bradley, cleaned, cv::MORPH_CLOSE, kernel_close);
+    // МОРФОЛОГИЧЕСКАЯ ФИЛЬТРАЦИЯ ШУМА
+    cv::Mat cleaned;
     
-    // // 2. Морфологическое открытие для удаления мелких объектов
-    // cv::Mat kernel_open = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
-    // cv::morphologyEx(cleaned, cleaned, cv::MORPH_OPEN, kernel_open);
+    // 1. Морфологическое закрытие для объединения близких областей
+    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+    cv::morphologyEx(binary_inv, cleaned, cv::MORPH_CLOSE, kernel_close);
     
-    // if (demo_mode) {
-    //     cv::Mat display_cleaned;
-    //     cv::cvtColor(cleaned, display_cleaned, cv::COLOR_GRAY2BGR);
-    //     cv::putText(display_cleaned, "4. After Noise Filtering", cv::Point(10, 30), 
-    //                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
-    //     cv::imshow("Processing Steps", display_cleaned);
-    //     cv::waitKey(0);
-    // }
+    // 2. Морфологическое открытие для удаления мелких объектов
+    cv::Mat kernel_open = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    cv::morphologyEx(cleaned, cleaned, cv::MORPH_OPEN, kernel_open);
+    
+    if (demo_mode) {
+        cv::Mat display_cleaned;
+        cv::cvtColor(cleaned, display_cleaned, cv::COLOR_GRAY2BGR);
+        cv::putText(display_cleaned, "4. After Noise Filtering (Inverted)", cv::Point(10, 30), 
+                   cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
+        cv::imshow("Processing Steps", display_cleaned);
+        cv::waitKey(0);
+    }
     
     // Поиск контуров с фильтрацией по размеру
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(binary_bradley, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(cleaned, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     
     // ФИЛЬТРАЦИЯ КОНТУРОВ ПО РАЗМЕРУ И ФОРМЕ
     std::vector<std::vector<cv::Point>> filtered_contours;
-    int min_contour_area = 50;  // Минимальная площадь контура
+    int min_contour_area = 10;   // Уменьшим для лучшей детекции
     int max_contour_area = 5000; // Максимальная площадь контура
     
     for (const auto& contour : contours) {
         double area = cv::contourArea(contour);
         if (area >= min_contour_area && area <= max_contour_area) {
-            // Дополнительная фильтрация по форме (опционально)
-            cv::Rect bbox = cv::boundingRect(contour);
-            double aspect_ratio = (double)bbox.width / bbox.height;
-            
-            // Фильтруем слишком вытянутые или слишком квадратные объекты
-            if (aspect_ratio >= 0.2 && aspect_ratio <= 5.0) {
-                filtered_contours.push_back(contour);
-            }
+            filtered_contours.push_back(contour);
         }
     }
     
     if (demo_mode) {
         std::cout << "Contour filtering: " << contours.size() << " -> " << filtered_contours.size() << " contours" << std::endl;
+        for (size_t i = 0; i < filtered_contours.size(); ++i) {
+            double area = cv::contourArea(filtered_contours[i]);
+            cv::Rect bbox = cv::boundingRect(filtered_contours[i]);
+            std::cout << "  Contour " << i << ": area=" << area 
+                      << ", bbox=[" << bbox.x << "," << bbox.y 
+                      << "," << bbox.width << "," << bbox.height << "]" << std::endl;
+        }
     }
     
     // Визуализация результатов
     if (demo_mode) {
-        cv::Mat result = frame.clone();
+        cv::Mat result = original_copy.clone(); // Используем копию оригинального изображения
         
         if (!filtered_contours.empty()) {
             cv::drawContours(result, filtered_contours, -1, cv::Scalar(0, 255, 0), 2);
             
-            std::string info = "Filtered contours: " + std::to_string(filtered_contours.size());
-            cv::putText(result, info, cv::Point(10, 30), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-            cv::putText(result, "TRIGGER ACTIVATED", cv::Point(10, 60), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+            for (const auto& contour : filtered_contours) {
+                cv::Rect bbox = cv::boundingRect(contour);
+                cv::rectangle(result, bbox, cv::Scalar(0, 200, 200), 1);
+            }
+            
+            std::string info = "Detected contours: " + std::to_string(filtered_contours.size());
+            cv::Point pos1(10, 30);
+            drawTextWithBackground(result, info, pos1, 0.7, 2);
+            
+            cv::Point pos2(10, 60);
+            drawTextWithBackground(result, "TRIGGER ACTIVATED", pos2, 0.7, 2);
         } else {
-            cv::putText(result, "No significant contours - NO TRIGGER", cv::Point(10, 30), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
+            cv::Point pos(10, 30);
+            drawTextWithBackground(result, "No significant contours - NO TRIGGER",
+                               pos, 0.7, 2);
         }
         
         cv::imshow("Processing Steps", result);
@@ -212,13 +273,14 @@ void print_usage(const char* prog_name) {
               << "  --iter N               Measurement iterations (default: 500)\n"
               << "  --window N             Bradley window size (default: 41)\n"
               << "  --sensitivity F        Bradley sensitivity (default: 0.15)\n"
+              << "  --block-frac N         Block fraction for window size (width/N) (default: 16)\n"
+              << "  --use-fixed-window     Use fixed window size instead of width-based\n"
               << "  --defect-ratio F       Ratio of frames with synthetic defects (default: 0.3)\n"
               << "  --demo                 Enable demonstration mode (shows processing steps)\n"
               << "  --input image.jpg      Process specific JPEG image file\n";
 }
 
 int main(int argc, char** argv) {
-    // Параметры по умолчанию (аналогично предыдущему тесту)
     int width = 640;
     int height = 480; 
     int num_frames = 50;
@@ -229,7 +291,6 @@ int main(int argc, char** argv) {
     std::string input_image_path;
     TriggerConfig config;
     
-    // Парсинг аргументов
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--width" && i + 1 < argc) width = std::stoi(argv[++i]);
@@ -239,6 +300,8 @@ int main(int argc, char** argv) {
         else if (arg == "--iter" && i + 1 < argc) measure_iter = std::stoi(argv[++i]);
         else if (arg == "--window" && i + 1 < argc) config.bradley_window = std::stoi(argv[++i]);
         else if (arg == "--sensitivity" && i + 1 < argc) config.bradley_sensitivity = std::stof(argv[++i]);
+        else if (arg == "--block-frac" && i + 1 < argc) config.block_fraction = std::stoi(argv[++i]);
+        else if (arg == "--use-fixed-window") config.use_fixed_window = true;
         else if (arg == "--defect-ratio" && i + 1 < argc) defect_ratio = std::stof(argv[++i]);
         else if (arg == "--demo") demo_mode = true;
         else if (arg == "--input" && i + 1 < argc) input_image_path = argv[++i];
@@ -274,7 +337,6 @@ int main(int argc, char** argv) {
         std::cout << "Input file: " << input_image_path << "\n";
         std::cout << "Original size: " << image.cols << "x" << image.rows << "\n";
         
-        // Изменяем размер если необходимо
         if (image.cols != 640 || image.rows != 480) {
             cv::resize(image, image, cv::Size(640, 480));
             std::cout << "Resized to: 640x480\n";
@@ -282,10 +344,16 @@ int main(int argc, char** argv) {
             std::cout << "No resizing needed\n";
         }
         
-        std::cout << "Bradley params: window=" << config.bradley_window 
-                  << ", sensitivity=" << config.bradley_sensitivity << "\n\n";
+        std::cout << "Bradley params:\n";
+        std::cout << "  Window mode: " << (config.use_fixed_window ? "fixed" : "width-based") << "\n";
+        if (config.use_fixed_window) {
+            std::cout << "  Window size: " << config.bradley_window << "\n";
+        } else {
+            std::cout << "  Block fraction: " << config.block_fraction << "\n";
+            std::cout << "  Calculated window: " << (640 / config.block_fraction) << "\n";
+        }
+        std::cout << "  Sensitivity: " << config.bradley_sensitivity << "\n\n";
         
-        // Обрабатываем изображение в демо-режиме
         bool trigger_activated = process_first_stage(image, config, true);
         std::cout << "Trigger activated: " << (trigger_activated ? "YES" : "NO") << "\n";
         
@@ -295,10 +363,10 @@ int main(int argc, char** argv) {
     
     // В демо-режиме меняем параметры для наглядности
     if (demo_mode) {
-        num_frames = 1;  // Только один кадр для демонстрации
+        num_frames = 1; 
         measure_iter = 1;
         warmup_iter = 0;
-        defect_ratio = 1.0f; // Всегда с дефектом
+        defect_ratio = 1.0f; 
         std::cout << "=== DEMO MODE: First Stage Trigger Algorithm ===\n";
     } else {
         std::cout << "=== First Stage Trigger Algorithm Benchmark ===\n";
@@ -307,11 +375,19 @@ int main(int argc, char** argv) {
     std::cout << "Resolution: " << width << "x" << height << "\n"
               << "Test frames: " << num_frames << " (defect ratio: " << defect_ratio * 100 << "%)\n"
               << "Warmup: " << warmup_iter << ", Measurements: " << measure_iter << "\n"
-              << "Bradley params: window=" << config.bradley_window << ", sensitivity=" << config.bradley_sensitivity << "\n\n";
+              << "Bradley params:\n"
+              << "  Window mode: " << (config.use_fixed_window ? "fixed" : "width-based") << "\n";
+    if (config.use_fixed_window) {
+        std::cout << "  Window size: " << config.bradley_window << "\n";
+    } else {
+        std::cout << "  Block fraction: " << config.block_fraction << "\n";
+        std::cout << "  Calculated window: " << (width / config.block_fraction) << "\n";
+    }
+    std::cout << "  Sensitivity: " << config.bradley_sensitivity << "\n\n";
     
     // Инициализация OpenCV
     cv::setUseOptimized(true);
-    cv::setNumThreads(0); // Автоматическое определение потоков
+    cv::setNumThreads(0); 
     
     // Генерация тестовых данных
     std::cout << "[init] Generating synthetic test frames...\n";
@@ -327,10 +403,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < num_frames; ++i) {
         cv::Mat frame(height, width, CV_8UC3);
         
-        // Базовый текстурный фон (имитация металлической поверхности)
+        // Базовый текстурный фон
         cv::randu(frame, cv::Scalar(100, 100, 100), cv::Scalar(200, 200, 200));
         
-        // Добавление синтетических дефектов на часть кадров
         if (defect_gen(gen) < defect_ratio) {
             int defect_type = i % 3;
             
@@ -357,7 +432,6 @@ int main(int argc, char** argv) {
         test_frames.push_back(frame.clone());
     }
     
-    // В демо-режиме показываем процесс, в обычном - делаем замеры
     if (demo_mode) {
         std::cout << "[demo] Showing processing steps for first frame...\n";
         std::cout << "Press any key to advance to next processing stage...\n";
@@ -406,7 +480,6 @@ int main(int argc, char** argv) {
     int total_triggers = std::count(triggers_activated.begin(), triggers_activated.end(), true);
     double trigger_rate = (static_cast<double>(total_triggers) / measure_iter) * 100.0;
     
-    // Вывод результатов
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "\n=== Benchmark Results ===\n"
               << "Total processing time: " << total_time << " ms\n"
@@ -417,7 +490,6 @@ int main(int argc, char** argv) {
               << "Throughput: " << fps << " FPS\n"
               << "Triggers activated: " << total_triggers << " (" << trigger_rate << "% of frames)\n";
     
-    // Проверка достижения целевых показателей
     std::cout << "\n=== Target Compliance ===\n";
     std::cout << "Target FPS: 200.0\n";
     std::cout << "Achieved FPS: " << fps << "\n";
